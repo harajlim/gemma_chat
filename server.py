@@ -1,27 +1,44 @@
 """
-Gemma 4 Chat Server
-- WebSocket streaming chat with conversation history
-- Image upload support (multimodal)
-- Tool calling: detect_objects (bounding box detection)
-- Throughput stats per response
+Gemma 4 Chat + Voice — one cohesive local app.
+
+Two capabilities, one server, one conversation surface:
+
+  • Rich TEXT chat (WebSocket /ws/chat) — streaming tokens, markdown, image upload
+    & multimodal, tool calling (web_search + detect_objects), live throughput stats.
+    [unchanged from the original testing_gemma app]
+
+  • Realtime VOICE (REST NDJSON, see voice/routes.py) — hands-free VAD mic loop:
+    Whisper STT -> Ollama brain -> Kokoro/Orpheus TTS, streamed back & played
+    gaplessly. [behaviour-identical to the real_time_voice app]
+
+The "brain" (default gemma4:12b) is shared: picking a model in the UI points both
+the text chat and the voice loop at the same Ollama model.
 """
 
 import asyncio
 import base64
 import io
 import json
+import re
 import subprocess
+import threading
 import time
 import uuid
 from pathlib import Path
+
+# Uploaded media ids are uuid4().hex (32 lowercase hex). Validating against this
+# before any filesystem glob neutralises path-traversal via client-sent ids.
+_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from ollama import chat as ollama_chat
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 
 from web_search import web_search
+from voice import engine as voice_engine
+from voice.routes import router as voice_router
 
 app = FastAPI()
 
@@ -35,13 +52,23 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 DETECTION_DIR = Path("detection")
 DETECTION_DIR.mkdir(exist_ok=True)
 
+# --- Models ---------------------------------------------------------------
+# All Gemma 4 variants on this machine. `vision` gates image input; `audio`
+# gates Gemma's NATIVE audio-attachment understanding (edge models only). The
+# realtime voice loop works with ANY brain (it uses Whisper for STT), so it is
+# independent of the `audio` flag. gemma4:12b is the smart default brain.
 MODEL_INFO = {
-    "gemma4:e4b": {"audio": True},
-    "gemma4:26b": {"audio": False},
+    "gemma4:12b": {"vision": True, "audio": False, "label": "12B · smart brain"},
+    "gemma4:e4b": {"vision": True, "audio": True, "label": "e4B · edge + audio"},
+    "gemma4:e2b": {"vision": True, "audio": True, "label": "e2B · light + audio"},
+    "gemma4:26b": {"vision": True, "audio": False, "label": "26B · largest"},
 }
 AVAILABLE_MODELS = list(MODEL_INFO.keys())
-DEFAULT_MODEL = "gemma4:e4b"
+DEFAULT_MODEL = "gemma4:12b"
 session_models: dict[str, str] = {}  # session_id -> model name
+
+# Keep the voice brain in sync with the chat default at boot.
+voice_engine.set_config(model=DEFAULT_MODEL)
 
 # --- Detection (from gemma_detect.py) ---
 
@@ -171,6 +198,11 @@ async def index():
     return FileResponse("static/index.html")
 
 
+@app.get("/tts")
+async def tts_page():
+    return FileResponse("static/tts.html")
+
+
 @app.post("/upload")
 async def upload_image(file: UploadFile = File(...)):
     """Upload an image and return an ID for referencing it in chat."""
@@ -237,6 +269,11 @@ async def get_audio(audio_id: str):
     return Response(status_code=404)
 
 
+# Realtime voice pipeline (STT -> brain -> TTS). Behaviour-identical to the
+# original real_time_voice app; see voice/routes.py + voice/engine.py.
+app.include_router(voice_router)
+
+
 # --- WebSocket Chat ---
 
 @app.websocket("/ws/chat")
@@ -261,18 +298,22 @@ async def websocket_chat(ws: WebSocket):
                 print(f"[session {session_id[:8]}] init, model={session_models[session_id]}")
                 await ws.send_text(json.dumps({"type": "session", "session_id": session_id}))
 
-            # Handle model switch
+            # Handle model switch — keep the voice brain in sync so the whole app
+            # uses ONE brain.
             if msg.get("type") == "set_model":
                 new_model = msg.get("model", DEFAULT_MODEL)
                 if new_model in AVAILABLE_MODELS:
                     session_models[session_id] = new_model
+                    voice_engine.set_config(model=new_model)
                 print(f"[session {session_id[:8]}] model switched to {session_models[session_id]}")
                 await ws.send_text(json.dumps({"type": "model_set", "model": session_models[session_id]}))
                 continue
 
             text = msg.get("text", "")
-            image_ids = msg.get("image_ids", [])
-            audio_ids = msg.get("audio_ids", [])
+            # Only accept well-formed ids (uuid4 hex) — never let a client-sent
+            # id reach a filesystem glob (path-traversal guard).
+            image_ids = [i for i in msg.get("image_ids", []) if isinstance(i, str) and _ID_RE.match(i)]
+            audio_ids = [a for a in msg.get("audio_ids", []) if isinstance(a, str) and _ID_RE.match(a)]
 
             # Skip messages with no content (e.g. session init)
             if not text and not image_ids and not audio_ids:
@@ -312,8 +353,21 @@ async def websocket_chat(ws: WebSocket):
 
             conversations[session_id].append(user_msg)
 
-            # Audio messages bypass tool-calling (tools mode breaks audio understanding)
-            await _generate_response(ws, session_id, use_tools=not has_audio, has_audio=has_audio)
+            # Audio messages bypass tool-calling (tools mode breaks audio understanding).
+            # Guarantee a terminal frame even if generation throws (e.g. Ollama
+            # error, OOM, or a non-JSON detection reply) — otherwise the client
+            # never sees `done` and its turn state (and the voice orb) get wedged.
+            try:
+                await _generate_response(ws, session_id, use_tools=not has_audio, has_audio=has_audio)
+            except WebSocketDisconnect:
+                raise
+            except Exception as e:
+                print(f"[session {session_id[:8]}] generation error: {e}")
+                try:
+                    await ws.send_text(json.dumps({"type": "error", "text": f"Generation failed: {e}"}))
+                    await ws.send_text(json.dumps({"type": "done"}))
+                except Exception:
+                    pass
 
     except WebSocketDisconnect:
         pass
@@ -323,7 +377,6 @@ async def _stream_response(ws: WebSocket, session_id: str, model: str,
                            messages: list[dict], options: dict | None = None):
     """Pure streaming call — no tools. Used for audio and the post-tool follow-up."""
     import queue
-    import threading
 
     q: queue.Queue = queue.Queue()
     start = time.perf_counter()
@@ -598,5 +651,29 @@ async def _generate_response(ws: WebSocket, session_id: str, use_tools: bool = T
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 if __name__ == "__main__":
+    import os
+    import socket as _socket
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+    port = int(os.environ.get("PORT", "8000"))
+    # Bind EXACTLY the requested interfaces (default just loopback). Binding one
+    # socket per host — never 0.0.0.0 — means tailnet mode adds the Tailscale IP
+    # WITHOUT ever exposing the wider local network. `run.sh --tailnet` sets
+    # BIND_HOSTS="127.0.0.1,<100.x tailscale ip>".
+    hosts = [h.strip() for h in os.environ.get("BIND_HOSTS", "127.0.0.1").split(",") if h.strip()]
+
+    # Warm the voice models in the background so the first spoken turn is fast.
+    print(f"[boot] brain={DEFAULT_MODEL}  voice={voice_engine.tts_label()}  warming models…")
+    threading.Thread(target=voice_engine.warm, daemon=True).start()
+
+    socks = []
+    for h in hosts:
+        fam = _socket.AF_INET6 if ":" in h else _socket.AF_INET
+        s = _socket.socket(fam, _socket.SOCK_STREAM)
+        s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        s.bind((h, port))
+        s.listen()
+        s.set_inheritable(True)
+        socks.append(s)
+        print(f"[boot] serving on  ->  http://{h}:{port}")
+    uvicorn.Server(uvicorn.Config(app, log_level="warning")).run(sockets=socks)

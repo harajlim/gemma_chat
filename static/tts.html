@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#17120f">
+<title>Voice Playground · Gemma 4</title>
+<link rel="stylesheet" href="/static/style.css?v=1">
+<style>
+  .wrap { max-width: 720px; margin: 0 auto; padding: clamp(20px, 5vw, 40px) clamp(16px, 4vw, 24px); }
+  .wrap h1 { font-family: var(--serif); font-weight: 600; font-size: clamp(24px, 5vw, 30px); margin-bottom: 6px; }
+  .wrap .sub { color: var(--text-dim); font-size: .9rem; margin-bottom: 4px; }
+  .wrap .links { margin-bottom: 20px; }
+  .wrap .links a { color: var(--terra); text-decoration: none; font-size: .85rem; border-bottom: 1px solid var(--terra-line); }
+  .pad textarea {
+    width: 100%; min-height: 150px; resize: vertical;
+    background: var(--bg); color: var(--text); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 14px; font-size: 1rem; line-height: 1.55;
+    font-family: var(--sans); outline: none;
+  }
+  .pad textarea:focus { border-color: var(--terra); }
+  .tags { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0 4px; }
+  .tag { background: var(--surface2); color: var(--terra); border: 1px solid var(--border); border-radius: 999px; padding: 5px 12px; font-size: .82rem; cursor: pointer; }
+  .tag:hover { border-color: var(--terra); }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin: 16px 0; }
+  .row label { display: flex; flex-direction: column; gap: 6px; font-size: .7rem; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; color: var(--text-faint); }
+  .row select { background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 9px; padding: 9px 12px; font-size: .9rem; font-family: var(--sans); }
+</style>
+</head>
+<body style="overflow:auto; height:auto;">
+  <div class="wrap">
+    <h1>Voice playground</h1>
+    <p class="sub" id="status">Type something and press Speak.</p>
+    <p class="sub">Emotion tags (<code>&lt;laugh&gt;</code>, <code>&lt;sigh&gt;</code>…) are rendered by the <b>Orpheus</b> engine — set it in the main app's settings.</p>
+    <p class="links"><a href="/">← back to chat + voice</a></p>
+
+    <div class="pad">
+      <div class="tags" id="tags"></div>
+      <textarea id="text" placeholder="Type text to speak. Drop in emotion tags like <laugh> or <sigh>.">Well, hello there! <laugh> It's so good to finally meet you. <sigh> I could talk all day.</textarea>
+      <div class="row">
+        <label>Voice
+          <select id="voice">
+            <option>tara</option><option>leah</option><option>jess</option><option>leo</option>
+            <option>dan</option><option>mia</option><option>zac</option><option>zoe</option>
+          </select>
+        </label>
+        <button class="btn" id="speak" style="align-self:flex-end">▶ Speak</button>
+        <button class="btn ghost" id="stop" style="align-self:flex-end">■ Stop</button>
+      </div>
+    </div>
+  </div>
+  <script src="/static/tts.js?v=1"></script>
+</body>
+</html>
