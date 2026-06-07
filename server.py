@@ -17,7 +17,6 @@ the text chat and the voice loop at the same Ollama model.
 
 import asyncio
 import base64
-import io
 import json
 import re
 import subprocess
@@ -34,9 +33,8 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from ollama import chat as ollama_chat
-from PIL import Image, ImageDraw
 
-from web_search import web_search
+import tools
 from voice import engine as voice_engine
 from voice.routes import router as voice_router
 
@@ -80,120 +78,8 @@ def list_model_info() -> dict:
 # Keep the voice brain in sync with the chat default at boot.
 voice_engine.set_config(model=DEFAULT_MODEL)
 
-# --- Detection (from gemma_detect.py) ---
-
-BBOX_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "bboxes": {
-            "type": "array",
-            "items": {
-                "type": "array",
-                "items": {"type": "integer"},
-                "minItems": 4,
-                "maxItems": 4,
-            },
-        }
-    },
-    "required": ["bboxes"],
-}
-
-
-def run_detection(image_bytes: bytes, target: str, model: str = DEFAULT_MODEL) -> tuple[list, bytes, float]:
-    """Run bbox detection on image bytes. Returns (bboxes, annotated_png_bytes, elapsed)."""
-    # Save temp image for ollama
-    tmp_path = UPLOAD_DIR / f"_detect_{uuid.uuid4().hex}.png"
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    img.save(tmp_path, "PNG")
-
-    prompt = (
-        f"Detect all {target} in this image. "
-        "Return bounding boxes as [y_min, x_min, y_max, x_max] "
-        "with coordinates normalized to 0-1000."
-    )
-
-    start = time.perf_counter()
-    response = ollama_chat(
-        model=model,
-        messages=[{"role": "user", "content": prompt, "images": [str(tmp_path)]}],
-        format=BBOX_SCHEMA,
-    )
-    elapsed = time.perf_counter() - start
-
-    result = json.loads(response.message.content)
-    bboxes = result.get("bboxes", [])
-
-    # Draw bboxes
-    w, h = img.size
-    draw = ImageDraw.Draw(img)
-    for i, (y_min, x_min, y_max, x_max) in enumerate(bboxes):
-        left = x_min / 1000 * w
-        top_ = y_min / 1000 * h
-        right = x_max / 1000 * w
-        bottom = y_max / 1000 * h
-        draw.rectangle([left, top_, right, bottom], outline="red", width=3)
-        draw.text((left + 4, top_ - 14), f"#{i + 1}", fill="red")
-
-    buf = io.BytesIO()
-    img.save(buf, "PNG")
-    annotated_bytes = buf.getvalue()
-
-    # Cleanup temp
-    tmp_path.unlink(missing_ok=True)
-
-    return bboxes, annotated_bytes, elapsed
-
-
-# --- Tool definition for the LLM ---
-
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "detect_objects",
-            "description": (
-                "Detect objects in an uploaded image and return bounding boxes. "
-                "Use this when the user asks to find, detect, or locate objects in an image. "
-                "You MUST specify the image_id of the image to run detection on."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "image_id": {
-                        "type": "string",
-                        "description": "The ID of the uploaded image to run detection on",
-                    },
-                    "target": {
-                        "type": "string",
-                        "description": "The object type to detect (e.g. 'people', 'cars', 'plates')",
-                    },
-                },
-                "required": ["image_id", "target"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": (
-                "Search the web via DuckDuckGo for current information. "
-                "Use this for questions about recent events, current facts, "
-                "or anything that requires up-to-date knowledge beyond your training data."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The search query",
-                    },
-                },
-                "required": ["query"],
-            },
-        },
-    },
-]
+# Tools (web_search + detect_objects) are shared with the voice path — see tools.py.
+TOOLS = tools.TOOLS
 
 
 # --- Routes ---
@@ -483,31 +369,25 @@ async def _execute_tool_call(ws: WebSocket, session_id: str, model: str, tc) -> 
             "text": f"Running detection for '{target}'...",
         }))
 
-        bboxes, annotated_bytes, detect_elapsed = await asyncio.to_thread(
-            run_detection, img_bytes, target, model
-        )
-
-        det_id = uuid.uuid4().hex
-        det_path = DETECTION_DIR / f"{det_id}.png"
-        det_path.write_bytes(annotated_bytes)
+        det = await asyncio.to_thread(tools.run_detection, img_bytes, target, model)
 
         conversations[session_id].append({
             "role": "tool",
             "content": json.dumps({
-                "bboxes": bboxes,
-                "count": len(bboxes),
-                "target": target,
-                "detection_time": f"{detect_elapsed:.2f}s",
+                "bboxes": det["bboxes"],
+                "count": det["count"],
+                "target": det["target"],
+                "detection_time": f"{det['detection_time_s']}s",
             }),
         })
 
         await ws.send_text(json.dumps({
             "type": "detection",
-            "image_url": f"/images/{det_id}",
-            "target": target,
-            "count": len(bboxes),
-            "bboxes": bboxes,
-            "detection_time_s": round(detect_elapsed, 2),
+            "image_url": det["image_url"],
+            "target": det["target"],
+            "count": det["count"],
+            "bboxes": det["bboxes"],
+            "detection_time_s": det["detection_time_s"],
         }))
 
     elif fn_name == "web_search":
@@ -518,25 +398,18 @@ async def _execute_tool_call(ws: WebSocket, session_id: str, model: str, tc) -> 
             "text": f"Searching the web for '{query}'...",
         }))
 
-        try:
-            search_start = time.perf_counter()
-            results = await asyncio.to_thread(web_search, query, 5)
-            search_elapsed = time.perf_counter() - search_start
-        except Exception as e:
-            results = []
-            search_elapsed = 0
-            print(f"[web_search] error: {e}")
+        res = await asyncio.to_thread(tools.run_web_search, query, 5)
 
         conversations[session_id].append({
             "role": "tool",
-            "content": json.dumps({"query": query, "results": results}),
+            "content": json.dumps({"query": res["query"], "results": res["results"]}),
         })
 
         await ws.send_text(json.dumps({
             "type": "web_search",
-            "query": query,
-            "results": results,
-            "search_time_s": round(search_elapsed, 2),
+            "query": res["query"],
+            "results": res["results"],
+            "search_time_s": res["search_time_s"],
         }))
 
     else:

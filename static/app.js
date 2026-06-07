@@ -100,20 +100,24 @@ function addMessage(role, content, images, opts) {
 }
 function addStatus(text) { const d = document.createElement("div"); d.className = "status-msg"; d.textContent = text; chatEl.appendChild(d); scrollToBottom(); }
 
-function addDetection(msg) {
-  if (!currentBubble) { currentBubble = addMessage("assistant", ""); currentBubbleText = ""; }
+function appendDetectionCard(contentEl, msg) {
   const card = document.createElement("div"); card.className = "detection-card";
   card.innerHTML = `<div class="det-header"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="1" y="1" width="22" height="22" rx="2"/><line x1="1" y1="8" x2="23" y2="8"/><line x1="8" y1="1" x2="8" y2="23"/></svg> Found ${msg.count} ${escapeHtml(msg.target)}(s)</div><img src="${msg.image_url}" alt="Detection result" loading="lazy"><div class="det-info">Detection time: ${msg.detection_time_s}s</div>`;
-  currentBubble.querySelector(".bubble-content").appendChild(card); scrollToBottom();
+  contentEl.appendChild(card); scrollToBottom();
 }
-function addWebSearch(msg) {
-  if (!currentBubble) { currentBubble = addMessage("assistant", ""); currentBubbleText = ""; }
+function appendSearchCard(contentEl, msg) {
   const card = document.createElement("div"); card.className = "search-card collapsed";
   const rows = (msg.results || []).map(r => `<div class="search-result"><a href="${escapeHtml(safeUrl(r.url))}" target="_blank" rel="noopener noreferrer" class="search-title">${escapeHtml(r.title)}</a><div class="search-url">${escapeHtml(r.url)}</div><div class="search-snippet">${escapeHtml(r.snippet)}</div></div>`).join("");
   card.innerHTML = `<div class="search-header"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg> Web search: "${escapeHtml(msg.query)}" · ${(msg.results||[]).length} results · ${msg.search_time_s}s<svg class="chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg></div><div class="search-body">${rows || '<div class="search-empty">No results</div>'}</div>`;
   card.querySelector(".search-header").addEventListener("click", () => card.classList.toggle("collapsed"));
-  currentBubble.querySelector(".bubble-content").appendChild(card); scrollToBottom();
+  contentEl.appendChild(card); scrollToBottom();
 }
+// chat (WS) path: attach to the current streaming assistant bubble
+function addDetection(msg) { if (!currentBubble) { currentBubble = addMessage("assistant", ""); currentBubbleText = ""; } appendDetectionCard(currentBubble.querySelector(".bubble-content"), msg); }
+function addWebSearch(msg) { if (!currentBubble) { currentBubble = addMessage("assistant", ""); currentBubbleText = ""; } appendSearchCard(currentBubble.querySelector(".bubble-content"), msg); }
+// voice path: each card is its own message in the thread
+function voiceDetectionCard(msg) { appendDetectionCard(addMessage("assistant", "").querySelector(".bubble-content"), msg); }
+function voiceSearchCard(msg) { appendSearchCard(addMessage("assistant", "").querySelector(".bubble-content"), msg); }
 function addStats(messageDiv, stats) {
   const bar = document.createElement("div"); bar.className = "stats-bar"; const items = [];
   if (stats.model) items.push(`<span class="stat">Model: <span class="stat-value">${stats.model}</span></span>`);
@@ -151,15 +155,33 @@ async function sendText() {
   if (!text && !pendingImages.length) return;
   if (isGenerating || turnBusy) return;
   if (running) pauseListening();          // typing while hands-free: pause the mic for this turn
+  if (speakOn) await voiceOutTyped(text); // type -> spoken reply (tools work too)
+  else await chatSend(text);              // type -> text reply (rich chat)
+}
 
-  // Images are a rich-chat feature -> always the text-out chat path.
-  if (speakOn && !pendingImages.length) {
-    textarea.value = ""; textarea.style.height = "auto";
-    addMessage("user", text, null, { plain: true });
-    await voiceOutTurn(() => { const fd = new FormData(); fd.append("text", text); return fetch("/api/converse_text", { method: "POST", body: fd, signal: convAbort.signal }); }, { showTranscript: false });
-  } else {
-    await chatSend(text);
+// Upload any attached images; returns their ids + display info, clears the tray.
+async function uploadPending() {
+  const imageIds = [], displays = [];
+  for (const img of pendingImages) {
+    const fd = new FormData(); fd.append("file", img.file);
+    try { const d = await (await fetch("/upload", { method: "POST", body: fd })).json(); imageIds.push(d.image_id); displays.push({ id: d.image_id, dataUrl: img.dataUrl }); }
+    catch (e) { console.error("upload:", e); }
   }
+  pendingImages = []; document.getElementById("imagePreviews").innerHTML = "";
+  return { imageIds, displays };
+}
+
+// type -> SPOKEN reply (Orpheus), with tools + image context.
+async function voiceOutTyped(text) {
+  const { imageIds, displays } = await uploadPending();
+  const prompt = text || (imageIds.length ? "What's in this image?" : "");
+  addMessage("user", text, displays, { plain: true });
+  textarea.value = ""; textarea.style.height = "auto";
+  await voiceOutTurn(() => {
+    const fd = new FormData(); fd.append("text", prompt);
+    if (imageIds.length) fd.append("image_ids", imageIds.join(","));
+    return fetch("/api/converse_text", { method: "POST", body: fd, signal: convAbort.signal });
+  }, { showTranscript: false });
 }
 
 // text-out (WS rich chat). `text` may come from typing or from transcribed speech.
@@ -167,15 +189,9 @@ async function chatSend(text) {
   if (!ws || ws.readyState !== WebSocket.OPEN) { addStatus("Reconnecting to the server — try again in a moment."); maybeRearm(); return; }
   isGenerating = true; sendBtn.disabled = true;
 
-  const imageIds = [], imageDisplays = [];
-  for (const img of pendingImages) {
-    const fd = new FormData(); fd.append("file", img.file);
-    try { const d = await (await fetch("/upload", { method: "POST", body: fd })).json(); imageIds.push(d.image_id); imageDisplays.push({ id: d.image_id, dataUrl: img.dataUrl }); }
-    catch (e) { console.error("upload:", e); }
-  }
+  const { imageIds, displays: imageDisplays } = await uploadPending();
   addMessage("user", text, imageDisplays);
   textarea.value = ""; textarea.style.height = "auto";
-  pendingImages = []; document.getElementById("imagePreviews").innerHTML = "";
 
   const typing = document.createElement("div"); typing.className = "message assistant"; typing.id = "typing";
   typing.innerHTML = `<div class="avatar">G</div><div class="bubble"><div class="typing-indicator"><span></span><span></span><span></span></div></div>`;
@@ -237,6 +253,8 @@ async function playStream(resp, showTranscript) {
         if (ev.type === "transcript") { if (showTranscript && ev.text) addMessage("user", ev.text, null, { plain: true }); }
         else if (ev.type === "reply_text") { aiBubble = addMessage("assistant", ev.text || "…", null, { spoken: true, plain: true }); }
         else if (ev.type === "audio") { const int16 = b64ToInt16(ev.pcm), sr = ev.sr || 24000; sawAudio = true; pending.push({ int16, sr }); bufferedSec += int16.length / sr; startIfReady(false); }
+        else if (ev.type === "web_search") { voiceSearchCard(ev); }
+        else if (ev.type === "detection") { voiceDetectionCard(ev); }
         else if (ev.type === "error") { const m = "⚠️ " + (ev.message || "Something went wrong."); if (aiBubble) aiBubble.querySelector(".bubble-content").textContent = m; else addMessage("assistant", m, null, { spoken: true, plain: true }); }
       }
     }
@@ -318,8 +336,9 @@ async function sendClip() {
   const ext = mimeType.includes("mp4") ? "mp4" : (mimeType.includes("ogg") ? "ogg" : "webm");
 
   if (speakOn) {
-    // talk -> SPOKEN reply (realtime /api/converse_stream, verbatim)
-    await voiceOutTurn(() => { const fd = new FormData(); fd.append("audio", blob, "turn." + ext); return fetch("/api/converse_stream", { method: "POST", body: fd, signal: convAbort.signal }); }, { showTranscript: true });
+    // talk -> SPOKEN reply (realtime /api/converse_stream); pass any attached image
+    const { imageIds } = await uploadPending();
+    await voiceOutTurn(() => { const fd = new FormData(); fd.append("audio", blob, "turn." + ext); if (imageIds.length) fd.append("image_ids", imageIds.join(",")); return fetch("/api/converse_stream", { method: "POST", body: fd, signal: convAbort.signal }); }, { showTranscript: true });
   } else {
     // talk -> TEXT reply: transcribe, then feed the rich chat
     setState("thinking");

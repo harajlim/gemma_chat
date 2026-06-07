@@ -76,8 +76,8 @@ def test_ws_tool_turn_web_search(monkeypatch, client):
                      eval_duration=1_000_000_000, prompt_eval_duration=100_000_000)
 
     monkeypatch.setattr(server, "ollama_chat", fake_chat)
-    monkeypatch.setattr(server, "web_search",
-                        lambda q, n=5: [{"title": "T", "url": "http://x", "snippet": "s"}])
+    monkeypatch.setattr(server.tools, "run_web_search",
+                        lambda q, n=5: {"query": q, "results": [{"title": "T", "url": "http://x", "snippet": "s"}], "search_time_s": 0.1})
 
     with client.websocket_connect("/ws/chat") as ws:
         ws.send_json({"session_id": "tool-sess"})
@@ -116,24 +116,50 @@ def test_ws_set_model_syncs_voice_brain(monkeypatch, client):
 
 # --- realtime voice: typed turn NDJSON protocol ----------------------------
 def test_converse_text_ndjson(monkeypatch, client):
-    monkeypatch.setattr(engine, "chat", lambda t: "Sure thing.")
-    # one fake audio frame: 240 samples of int16 silence @ 24k
-    monkeypatch.setattr(engine, "tts_stream",
-                        lambda text, voice=None: iter([(b"\x00\x00" * 240, 24000)]))
+    from voice import routes
+    # no tool calls -> straight spoken answer
+    monkeypatch.setattr(routes, "ollama_chat", lambda *a, **k: _resp(content="Sure thing."))
+    monkeypatch.setattr(engine, "tts_stream", lambda text, voice=None: iter([(b"\x00\x00" * 240, 24000)]))
 
     r = client.post("/api/converse_text", data={"text": "hello there"})
     assert r.status_code == 200
     events = [json.loads(l) for l in r.text.splitlines() if l.strip()]
     types = [e["type"] for e in events]
 
-    assert types[0] == "transcript"
-    assert events[0]["text"] == "hello there"
-    assert "reply_text" in types
+    assert types[0] == "transcript" and events[0]["text"] == "hello there"
     reply = next(e for e in events if e["type"] == "reply_text")
     assert reply["text"] == "Sure thing."
     audio = [e for e in events if e["type"] == "audio"]
     assert audio and audio[0]["sr"] == 24000 and audio[0]["pcm"]
     assert types[-1] == "done"
+
+
+def test_converse_text_speaks_tool_announcement(monkeypatch, client):
+    """Voice mode uses tools and SPEAKS an announcement when one fires."""
+    from voice import routes
+    calls = {"n": 0}
+
+    def fake_chat(*a, **k):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _resp(content="", tool_calls=[_toolcall("web_search", {"query": "gemma 4 news"})])
+        return _resp(content="Gemma 4 just shipped voice support.")
+
+    monkeypatch.setattr(routes, "ollama_chat", fake_chat)
+    monkeypatch.setattr(routes.tools, "run_web_search",
+                        lambda q, n=5: {"query": q, "results": [{"title": "T", "url": "http://x", "snippet": "s"}], "search_time_s": 0.1})
+    monkeypatch.setattr(engine, "tts_stream", lambda text, voice=None: iter([(b"\x00\x00" * 240, 24000)]))
+
+    r = client.post("/api/converse_text", data={"text": "what's new with gemma 4?"})
+    events = [json.loads(l) for l in r.text.splitlines() if l.strip()]
+    types = [e["type"] for e in events]
+    replies = [e["text"] for e in events if e["type"] == "reply_text"]
+
+    assert "web_search" in types                       # the search card is shown
+    assert any("search the web" in t.lower() for t in replies)   # spoken announcement
+    assert any("shipped voice" in t for t in replies)            # spoken grounded answer
+    assert types[-1] == "done"
+    assert calls["n"] == 2
 
 
 def test_converse_text_empty_is_graceful(monkeypatch, client):

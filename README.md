@@ -16,7 +16,10 @@ Two toggles give a 2×2 of input × output:
 | **Mic: on** | talk → text reply | talk → **spoken** reply |
 
 The two **Speak-on** paths use realtime's exact endpoints (`/api/converse_text`,
-`/api/converse_stream`), so spoken replies are identical in quality to the realtime_voice app.
+`/api/converse_stream`) for identical Orpheus quality — and they run the **same tools** as the chat
+(web_search + detect_objects). When a tool fires in voice mode, the assistant first **speaks** a short
+"what I'm doing" line (e.g. *"Let me search the web for…"*), runs the tool, then speaks the grounded
+answer.
 
 Everything runs on-device. The "brain" — **`gemma4:12b`** by default — is shared: pick a model once
 and both the text chat and the voice loop use it.
