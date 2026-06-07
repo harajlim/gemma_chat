@@ -6,3 +6,8 @@ uploads/
 detection/
 *.egg-info/
 .env
+# Large local TTS model files are referenced from VOICE_MODELS_DIR, never committed
+models/
+*.onnx
+*.gguf
+*.bin

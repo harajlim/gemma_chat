@@ -1,27 +1,42 @@
 """
-Gemma 4 Chat Server
-- WebSocket streaming chat with conversation history
-- Image upload support (multimodal)
-- Tool calling: detect_objects (bounding box detection)
-- Throughput stats per response
+Gemma 4 Chat + Voice — one cohesive local app.
+
+Two capabilities, one server, one conversation surface:
+
+  • Rich TEXT chat (WebSocket /ws/chat) — streaming tokens, markdown, image upload
+    & multimodal, tool calling (web_search + detect_objects), live throughput stats.
+    [unchanged from the original testing_gemma app]
+
+  • Realtime VOICE (REST NDJSON, see voice/routes.py) — hands-free VAD mic loop:
+    Whisper STT -> Ollama brain -> Orpheus TTS, streamed back & played
+    gaplessly. [behaviour-identical to the real_time_voice app]
+
+The "brain" (default gemma4:12b) is shared: picking a model in the UI points both
+the text chat and the voice loop at the same Ollama model.
 """
 
 import asyncio
 import base64
-import io
 import json
+import re
 import subprocess
+import threading
 import time
 import uuid
 from pathlib import Path
+
+# Uploaded media ids are uuid4().hex (32 lowercase hex). Validating against this
+# before any filesystem glob neutralises path-traversal via client-sent ids.
+_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, UploadFile, File
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from ollama import chat as ollama_chat
-from PIL import Image, ImageDraw, ImageFont
 
-from web_search import web_search
+import tools
+from voice import engine as voice_engine
+from voice.routes import router as voice_router
 
 app = FastAPI()
 
@@ -35,140 +50,53 @@ UPLOAD_DIR.mkdir(exist_ok=True)
 DETECTION_DIR = Path("detection")
 DETECTION_DIR.mkdir(exist_ok=True)
 
-MODEL_INFO = {
-    "gemma4:e4b": {"audio": True},
-    "gemma4:26b": {"audio": False},
+# --- Models ---------------------------------------------------------------
+# The brain picker lists EVERY usable Ollama chat model on this machine (just
+# like the realtime_voice app did) — gemma4:*, qwen-unc, whatever you've pulled —
+# excluding the TTS model. `vision` gates image input / detection; `audio` gates
+# Gemma's native audio-attachment understanding (edge models only). The realtime
+# voice loop uses Whisper for STT, so it works with any brain regardless of flags.
+DEFAULT_MODEL = "gemma4:12b"
+_KNOWN_CAPS = {
+    "gemma4:12b": {"vision": True, "audio": False},
+    "gemma4:e4b": {"vision": True, "audio": True},
+    "gemma4:e2b": {"vision": True, "audio": True},
+    "gemma4:26b": {"vision": True, "audio": False},
 }
-AVAILABLE_MODELS = list(MODEL_INFO.keys())
-DEFAULT_MODEL = "gemma4:e4b"
 session_models: dict[str, str] = {}  # session_id -> model name
 
-# --- Detection (from gemma_detect.py) ---
 
-BBOX_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "bboxes": {
-            "type": "array",
-            "items": {
-                "type": "array",
-                "items": {"type": "integer"},
-                "minItems": 4,
-                "maxItems": 4,
-            },
-        }
-    },
-    "required": ["bboxes"],
-}
+def list_model_info() -> dict:
+    """Every Ollama chat model -> capability flags. Unknown models default to
+    text-only (vision/audio False) but are still selectable as the brain."""
+    names = voice_engine.list_chat_models()
+    if DEFAULT_MODEL not in names:
+        names = [DEFAULT_MODEL, *names]
+    return {n: dict(_KNOWN_CAPS.get(n, {"vision": False, "audio": False})) for n in names}
 
 
-def run_detection(image_bytes: bytes, target: str, model: str = DEFAULT_MODEL) -> tuple[list, bytes, float]:
-    """Run bbox detection on image bytes. Returns (bboxes, annotated_png_bytes, elapsed)."""
-    # Save temp image for ollama
-    tmp_path = UPLOAD_DIR / f"_detect_{uuid.uuid4().hex}.png"
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    img.save(tmp_path, "PNG")
+# Keep the voice brain in sync with the chat default at boot.
+voice_engine.set_config(model=DEFAULT_MODEL)
 
-    prompt = (
-        f"Detect all {target} in this image. "
-        "Return bounding boxes as [y_min, x_min, y_max, x_max] "
-        "with coordinates normalized to 0-1000."
-    )
-
-    start = time.perf_counter()
-    response = ollama_chat(
-        model=model,
-        messages=[{"role": "user", "content": prompt, "images": [str(tmp_path)]}],
-        format=BBOX_SCHEMA,
-    )
-    elapsed = time.perf_counter() - start
-
-    result = json.loads(response.message.content)
-    bboxes = result.get("bboxes", [])
-
-    # Draw bboxes
-    w, h = img.size
-    draw = ImageDraw.Draw(img)
-    for i, (y_min, x_min, y_max, x_max) in enumerate(bboxes):
-        left = x_min / 1000 * w
-        top_ = y_min / 1000 * h
-        right = x_max / 1000 * w
-        bottom = y_max / 1000 * h
-        draw.rectangle([left, top_, right, bottom], outline="red", width=3)
-        draw.text((left + 4, top_ - 14), f"#{i + 1}", fill="red")
-
-    buf = io.BytesIO()
-    img.save(buf, "PNG")
-    annotated_bytes = buf.getvalue()
-
-    # Cleanup temp
-    tmp_path.unlink(missing_ok=True)
-
-    return bboxes, annotated_bytes, elapsed
-
-
-# --- Tool definition for the LLM ---
-
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "detect_objects",
-            "description": (
-                "Detect objects in an uploaded image and return bounding boxes. "
-                "Use this when the user asks to find, detect, or locate objects in an image. "
-                "You MUST specify the image_id of the image to run detection on."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "image_id": {
-                        "type": "string",
-                        "description": "The ID of the uploaded image to run detection on",
-                    },
-                    "target": {
-                        "type": "string",
-                        "description": "The object type to detect (e.g. 'people', 'cars', 'plates')",
-                    },
-                },
-                "required": ["image_id", "target"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": (
-                "Search the web via DuckDuckGo for current information. "
-                "Use this for questions about recent events, current facts, "
-                "or anything that requires up-to-date knowledge beyond your training data."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "The search query",
-                    },
-                },
-                "required": ["query"],
-            },
-        },
-    },
-]
+# Tools (web_search + detect_objects) are shared with the voice path — see tools.py.
+TOOLS = tools.TOOLS
 
 
 # --- Routes ---
 
 @app.get("/models")
 async def list_models():
-    return {"models": MODEL_INFO, "default": DEFAULT_MODEL}
+    return {"models": list_model_info(), "default": DEFAULT_MODEL}
 
 
 @app.get("/")
 async def index():
     return FileResponse("static/index.html")
+
+
+@app.get("/tts")
+async def tts_page():
+    return FileResponse("static/tts.html")
 
 
 @app.post("/upload")
@@ -237,6 +165,11 @@ async def get_audio(audio_id: str):
     return Response(status_code=404)
 
 
+# Realtime voice pipeline (STT -> brain -> TTS). Behaviour-identical to the
+# original real_time_voice app; see voice/routes.py + voice/engine.py.
+app.include_router(voice_router)
+
+
 # --- WebSocket Chat ---
 
 @app.websocket("/ws/chat")
@@ -261,18 +194,22 @@ async def websocket_chat(ws: WebSocket):
                 print(f"[session {session_id[:8]}] init, model={session_models[session_id]}")
                 await ws.send_text(json.dumps({"type": "session", "session_id": session_id}))
 
-            # Handle model switch
+            # Handle model switch — keep the voice brain in sync so the whole app
+            # uses ONE brain.
             if msg.get("type") == "set_model":
                 new_model = msg.get("model", DEFAULT_MODEL)
-                if new_model in AVAILABLE_MODELS:
+                if new_model in list_model_info():
                     session_models[session_id] = new_model
+                    voice_engine.set_config(model=new_model)
                 print(f"[session {session_id[:8]}] model switched to {session_models[session_id]}")
                 await ws.send_text(json.dumps({"type": "model_set", "model": session_models[session_id]}))
                 continue
 
             text = msg.get("text", "")
-            image_ids = msg.get("image_ids", [])
-            audio_ids = msg.get("audio_ids", [])
+            # Only accept well-formed ids (uuid4 hex) — never let a client-sent
+            # id reach a filesystem glob (path-traversal guard).
+            image_ids = [i for i in msg.get("image_ids", []) if isinstance(i, str) and _ID_RE.match(i)]
+            audio_ids = [a for a in msg.get("audio_ids", []) if isinstance(a, str) and _ID_RE.match(a)]
 
             # Skip messages with no content (e.g. session init)
             if not text and not image_ids and not audio_ids:
@@ -312,8 +249,21 @@ async def websocket_chat(ws: WebSocket):
 
             conversations[session_id].append(user_msg)
 
-            # Audio messages bypass tool-calling (tools mode breaks audio understanding)
-            await _generate_response(ws, session_id, use_tools=not has_audio, has_audio=has_audio)
+            # Audio messages bypass tool-calling (tools mode breaks audio understanding).
+            # Guarantee a terminal frame even if generation throws (e.g. Ollama
+            # error, OOM, or a non-JSON detection reply) — otherwise the client
+            # never sees `done` and its turn state (and the voice orb) get wedged.
+            try:
+                await _generate_response(ws, session_id, use_tools=not has_audio, has_audio=has_audio)
+            except WebSocketDisconnect:
+                raise
+            except Exception as e:
+                print(f"[session {session_id[:8]}] generation error: {e}")
+                try:
+                    await ws.send_text(json.dumps({"type": "error", "text": f"Generation failed: {e}"}))
+                    await ws.send_text(json.dumps({"type": "done"}))
+                except Exception:
+                    pass
 
     except WebSocketDisconnect:
         pass
@@ -323,7 +273,6 @@ async def _stream_response(ws: WebSocket, session_id: str, model: str,
                            messages: list[dict], options: dict | None = None):
     """Pure streaming call — no tools. Used for audio and the post-tool follow-up."""
     import queue
-    import threading
 
     q: queue.Queue = queue.Queue()
     start = time.perf_counter()
@@ -420,31 +369,25 @@ async def _execute_tool_call(ws: WebSocket, session_id: str, model: str, tc) -> 
             "text": f"Running detection for '{target}'...",
         }))
 
-        bboxes, annotated_bytes, detect_elapsed = await asyncio.to_thread(
-            run_detection, img_bytes, target, model
-        )
-
-        det_id = uuid.uuid4().hex
-        det_path = DETECTION_DIR / f"{det_id}.png"
-        det_path.write_bytes(annotated_bytes)
+        det = await asyncio.to_thread(tools.run_detection, img_bytes, target, model)
 
         conversations[session_id].append({
             "role": "tool",
             "content": json.dumps({
-                "bboxes": bboxes,
-                "count": len(bboxes),
-                "target": target,
-                "detection_time": f"{detect_elapsed:.2f}s",
+                "bboxes": det["bboxes"],
+                "count": det["count"],
+                "target": det["target"],
+                "detection_time": f"{det['detection_time_s']}s",
             }),
         })
 
         await ws.send_text(json.dumps({
             "type": "detection",
-            "image_url": f"/images/{det_id}",
-            "target": target,
-            "count": len(bboxes),
-            "bboxes": bboxes,
-            "detection_time_s": round(detect_elapsed, 2),
+            "image_url": det["image_url"],
+            "target": det["target"],
+            "count": det["count"],
+            "bboxes": det["bboxes"],
+            "detection_time_s": det["detection_time_s"],
         }))
 
     elif fn_name == "web_search":
@@ -455,25 +398,18 @@ async def _execute_tool_call(ws: WebSocket, session_id: str, model: str, tc) -> 
             "text": f"Searching the web for '{query}'...",
         }))
 
-        try:
-            search_start = time.perf_counter()
-            results = await asyncio.to_thread(web_search, query, 5)
-            search_elapsed = time.perf_counter() - search_start
-        except Exception as e:
-            results = []
-            search_elapsed = 0
-            print(f"[web_search] error: {e}")
+        res = await asyncio.to_thread(tools.run_web_search, query, 5)
 
         conversations[session_id].append({
             "role": "tool",
-            "content": json.dumps({"query": query, "results": results}),
+            "content": json.dumps({"query": res["query"], "results": res["results"]}),
         })
 
         await ws.send_text(json.dumps({
             "type": "web_search",
-            "query": query,
-            "results": results,
-            "search_time_s": round(search_elapsed, 2),
+            "query": res["query"],
+            "results": res["results"],
+            "search_time_s": res["search_time_s"],
         }))
 
     else:
@@ -598,5 +534,29 @@ async def _generate_response(ws: WebSocket, session_id: str, use_tools: bool = T
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 if __name__ == "__main__":
+    import os
+    import socket as _socket
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+    port = int(os.environ.get("PORT", "8000"))
+    # Bind EXACTLY the requested interfaces (default just loopback). Binding one
+    # socket per host — never 0.0.0.0 — means tailnet mode adds the Tailscale IP
+    # WITHOUT ever exposing the wider local network. `run.sh --tailnet` sets
+    # BIND_HOSTS="127.0.0.1,<100.x tailscale ip>".
+    hosts = [h.strip() for h in os.environ.get("BIND_HOSTS", "127.0.0.1").split(",") if h.strip()]
+
+    # Warm the voice models in the background so the first spoken turn is fast.
+    print(f"[boot] brain={DEFAULT_MODEL}  voice={voice_engine.tts_label()}  warming models…")
+    threading.Thread(target=voice_engine.warm, daemon=True).start()
+
+    socks = []
+    for h in hosts:
+        fam = _socket.AF_INET6 if ":" in h else _socket.AF_INET
+        s = _socket.socket(fam, _socket.SOCK_STREAM)
+        s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        s.bind((h, port))
+        s.listen()
+        s.set_inheritable(True)
+        socks.append(s)
+        print(f"[boot] serving on  ->  http://{h}:{port}")
+    uvicorn.Server(uvicorn.Config(app, log_level="warning")).run(sockets=socks)
