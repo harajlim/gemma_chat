@@ -60,18 +60,13 @@ def test_sentences_empty():
 
 
 # --- config / state --------------------------------------------------------
-def test_set_config_switches_engine_and_voice():
-    engine.set_config(engine="kokoro", voice="am_adam")
-    assert engine._state["engine"] == "kokoro"
-    assert engine.current_voice() == "am_adam"
-
-    engine.set_config(engine="orpheus", voice="leo")
-    assert engine._state["engine"] == "orpheus"
+def test_set_config_switches_voice_and_model():
+    engine.set_config(voice="leo", model="gemma4:e4b")
     assert engine.current_voice() == "leo"
-    # kokoro voice retained independently
-    assert engine._state["kokoro_voice"] == "am_adam"
-    # restore default for other tests
-    engine.set_config(engine="kokoro", voice="af_heart", model="gemma4:12b")
+    assert engine._state["model"] == "gemma4:e4b"
+    # restore defaults for other tests
+    engine.set_config(voice="tara", model="gemma4:12b")
+    assert engine.current_voice() == "tara"
 
 
 def test_set_config_system_prompt_roundtrip():
@@ -92,10 +87,9 @@ def test_reset_history_keeps_system_prompt():
     engine.set_system_prompt(engine.SYSTEM_PROMPT)
 
 
-def test_available_voices_kokoro():
-    engine.set_config(engine="kokoro")
+def test_available_voices_orpheus():
     voices = engine.available_voices()
-    assert "af_heart" in voices
+    assert "tara" in voices
 
 
 # --- model listing (mock ollama) ------------------------------------------

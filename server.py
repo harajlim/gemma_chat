@@ -8,7 +8,7 @@ Two capabilities, one server, one conversation surface:
     [unchanged from the original testing_gemma app]
 
   • Realtime VOICE (REST NDJSON, see voice/routes.py) — hands-free VAD mic loop:
-    Whisper STT -> Ollama brain -> Kokoro/Orpheus TTS, streamed back & played
+    Whisper STT -> Ollama brain -> Orpheus TTS, streamed back & played
     gaplessly. [behaviour-identical to the real_time_voice app]
 
 The "brain" (default gemma4:12b) is shared: picking a model in the UI points both
@@ -53,19 +53,29 @@ DETECTION_DIR = Path("detection")
 DETECTION_DIR.mkdir(exist_ok=True)
 
 # --- Models ---------------------------------------------------------------
-# All Gemma 4 variants on this machine. `vision` gates image input; `audio`
-# gates Gemma's NATIVE audio-attachment understanding (edge models only). The
-# realtime voice loop works with ANY brain (it uses Whisper for STT), so it is
-# independent of the `audio` flag. gemma4:12b is the smart default brain.
-MODEL_INFO = {
-    "gemma4:12b": {"vision": True, "audio": False, "label": "12B · smart brain"},
-    "gemma4:e4b": {"vision": True, "audio": True, "label": "e4B · edge + audio"},
-    "gemma4:e2b": {"vision": True, "audio": True, "label": "e2B · light + audio"},
-    "gemma4:26b": {"vision": True, "audio": False, "label": "26B · largest"},
-}
-AVAILABLE_MODELS = list(MODEL_INFO.keys())
+# The brain picker lists EVERY usable Ollama chat model on this machine (just
+# like the realtime_voice app did) — gemma4:*, qwen-unc, whatever you've pulled —
+# excluding the TTS model. `vision` gates image input / detection; `audio` gates
+# Gemma's native audio-attachment understanding (edge models only). The realtime
+# voice loop uses Whisper for STT, so it works with any brain regardless of flags.
 DEFAULT_MODEL = "gemma4:12b"
+_KNOWN_CAPS = {
+    "gemma4:12b": {"vision": True, "audio": False},
+    "gemma4:e4b": {"vision": True, "audio": True},
+    "gemma4:e2b": {"vision": True, "audio": True},
+    "gemma4:26b": {"vision": True, "audio": False},
+}
 session_models: dict[str, str] = {}  # session_id -> model name
+
+
+def list_model_info() -> dict:
+    """Every Ollama chat model -> capability flags. Unknown models default to
+    text-only (vision/audio False) but are still selectable as the brain."""
+    names = voice_engine.list_chat_models()
+    if DEFAULT_MODEL not in names:
+        names = [DEFAULT_MODEL, *names]
+    return {n: dict(_KNOWN_CAPS.get(n, {"vision": False, "audio": False})) for n in names}
+
 
 # Keep the voice brain in sync with the chat default at boot.
 voice_engine.set_config(model=DEFAULT_MODEL)
@@ -190,7 +200,7 @@ TOOLS = [
 
 @app.get("/models")
 async def list_models():
-    return {"models": MODEL_INFO, "default": DEFAULT_MODEL}
+    return {"models": list_model_info(), "default": DEFAULT_MODEL}
 
 
 @app.get("/")
@@ -302,7 +312,7 @@ async def websocket_chat(ws: WebSocket):
             # uses ONE brain.
             if msg.get("type") == "set_model":
                 new_model = msg.get("model", DEFAULT_MODEL)
-                if new_model in AVAILABLE_MODELS:
+                if new_model in list_model_info():
                     session_models[session_id] = new_model
                     voice_engine.set_config(model=new_model)
                 print(f"[session {session_id[:8]}] model switched to {session_models[session_id]}")

@@ -3,41 +3,29 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
-<meta name="theme-color" content="#17120f">
+<meta name="theme-color" content="#0d1117">
 <title>Gemma 4 · Chat + Voice</title>
-<link rel="stylesheet" href="/static/style.css?v=1">
+<link rel="stylesheet" href="/static/style.css?v=2">
 <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 </head>
 <body>
 
 <header class="header">
-  <div class="brand">
-    <span class="mark">Gemma 4</span>
-    <span class="model-badge hide-sm" id="modeBadge">chat + voice</span>
-  </div>
+  <h1>Gemma 4 Chat</h1>
   <div class="spacer"></div>
-
   <div class="context-meter" id="contextMeter" title="Context window usage">
-    <span class="meter-label">Context</span>
+    <span>Context</span>
     <div class="meter-bar"><div class="meter-fill" id="meterFill" style="width:0%"></div></div>
     <span class="meter-text" id="meterText">0 / 131K</span>
   </div>
-
   <select class="model-select" id="modelSelect" title="Choose the brain"></select>
-
   <details class="settings" id="settings">
-    <summary class="hbtn gear" aria-label="Settings" title="Voice & personality settings">
+    <summary class="hbtn gear" aria-label="Voice settings" title="Voice settings">
       <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.5v2.4M12 19.1v2.4M21.5 12h-2.4M4.9 12H2.5M18.7 5.3l-1.7 1.7M7 17l-1.7 1.7M18.7 18.7L17 17M7 7 5.3 5.3"/></svg>
     </summary>
-    <div class="panel" role="dialog" aria-label="Settings">
-      <h3>Voice &amp; personality</h3>
-      <label class="fld"><span>TTS engine</span>
-        <select id="engineSel">
-          <option value="kokoro">Kokoro — fast &amp; clear</option>
-          <option value="orpheus">Orpheus — expressive (emotion)</option>
-        </select>
-      </label>
-      <label class="fld"><span>Voice</span><select id="voiceSel"></select></label>
+    <div class="panel" role="dialog" aria-label="Voice settings">
+      <h3>Voice settings</h3>
+      <label class="fld"><span>Voice (Orpheus)</span><select id="voiceSel"></select></label>
       <label class="fld"><span>Voice personality (spoken replies)</span>
         <textarea id="sysprompt" rows="4" spellcheck="false"></textarea>
       </label>
@@ -52,7 +40,6 @@
       <p class="panel-foot"><a href="/tts" target="_blank" rel="noopener">Voice playground →</a></p>
     </div>
   </details>
-
   <button class="hbtn clear" onclick="clearChat()" aria-label="Clear chat" title="Clear conversation">
     <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>
   </button>
@@ -60,10 +47,9 @@
 
 <div class="chat-container" id="chat">
   <div class="empty-state" id="emptyState">
-    <h2>Talk or type to Gemma 4</h2>
-    <p>Type for rich chat — markdown, image upload, web search and object detection.
-       Tap the mic for a hands-free spoken conversation.</p>
-    <p class="hintline">Everything runs locally on this machine.</p>
+    <h2>Gemma 4 — Chat + Voice</h2>
+    <p>Type for rich chat with web search, object detection and images. Flip <b>Mic</b> to talk hands-free,
+       and <b>Speak</b> to hear replies aloud. Everything runs locally.</p>
   </div>
 </div>
 
@@ -71,34 +57,34 @@
 
 <div class="input-area">
   <div class="input-wrapper">
-    <p class="voice-hint" id="voiceHint" aria-live="polite"></p>
+    <div class="io-toggles">
+      <button class="toggle mic" id="micToggle" type="button" aria-pressed="false" title="Voice input (hands-free)">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0"/><line x1="12" y1="17.5" x2="12" y2="20.6"/><line x1="8.6" y1="20.6" x2="15.4" y2="20.6"/></svg>
+        Mic <span class="state" id="micState">off</span>
+      </button>
+      <button class="toggle speak" id="speakToggle" type="button" aria-pressed="false" title="Speak replies aloud (Orpheus)">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M11 5 6 9H3v6h3l5 4V5z"/><path d="M15.5 8.5a5 5 0 0 1 0 7M18.5 6a8 8 0 0 1 0 12"/></svg>
+        Speak <span class="state" id="speakState">off</span>
+      </button>
+      <span class="voice-status" id="voiceStatus" aria-live="polite"></span>
+    </div>
+
     <div class="image-previews" id="imagePreviews"></div>
     <div class="audio-previews" id="audioPreviews"></div>
+
     <div class="composer">
       <label class="icon-btn" title="Upload image" aria-label="Upload image">
         <svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>
         <input type="file" id="fileInput" accept="image/*" multiple hidden>
       </label>
-
-      <button class="icon-btn chat-mic" id="chatMicBtn" type="button" aria-label="Record audio clip for the model" title="Record an audio clip for the model" hidden>
-        <svg viewBox="0 0 24 24"><path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 11a7 7 0 0 1-14 0"/><line x1="12" y1="18" x2="12" y2="22"/><line x1="8" y1="22" x2="16" y2="22"/></svg>
-      </button>
-
-      <textarea id="userInput" placeholder="Message Gemma 4…  (or tap the mic to talk)" rows="1" enterkeyhint="send"></textarea>
-
-      <div class="orb idle" id="orb" role="button" tabindex="0" aria-pressed="false"
-           aria-label="Start voice conversation" title="Tap to talk">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5.5 11a6.5 6.5 0 0 0 13 0"/><line x1="12" y1="17.5" x2="12" y2="20.6"/><line x1="8.6" y1="20.6" x2="15.4" y2="20.6"/></svg>
-        <span id="orbLabel" class="sr-only">Start</span>
-      </div>
-
-      <button class="icon-btn send-btn" id="sendBtn" onclick="sendMessage()" title="Send" aria-label="Send">
+      <textarea id="userInput" placeholder="Message Gemma 4…" rows="1" enterkeyhint="send"></textarea>
+      <button class="icon-btn send-btn" id="sendBtn" onclick="sendText()" title="Send" aria-label="Send">
         <svg viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
       </button>
     </div>
   </div>
 </div>
 
-<script src="/static/app.js?v=1"></script>
+<script src="/static/app.js?v=2"></script>
 </body>
 </html>

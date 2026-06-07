@@ -15,7 +15,7 @@ cd "$(dirname "$0")"
 
 # --- pick the Python interpreter ------------------------------------------
 # The merged app needs BOTH stacks: ollama/Pillow/ddgs (chat+tools) and the ML
-# stack mlx_whisper/kokoro_onnx/snac/torch (voice). The real_time_voice .venv has
+# stack mlx_whisper/snac/torch (voice). The real_time_voice .venv has
 # the ML stack; we added the chat deps to it. Override with VENV_PYTHON if you
 # built your own combined env (see requirements.txt).
 DEFAULT_VENV="/Users/mharajli/Desktop/agent_space/real_time_voice/.venv/bin/python"
@@ -33,6 +33,11 @@ curl -s http://localhost:11434/api/tags >/dev/null \
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 export HF_HUB_DISABLE_TELEMETRY=1
+export PYTORCH_ENABLE_MPS_FALLBACK=1
+
+# --- voice = Orpheus (the realtime build): emotive TTS + gemma4:12b brain -----
+export VOICE_LLM_MODEL="${VOICE_LLM_MODEL:-gemma4:12b}"
+export ORPHEUS_VOICE="${ORPHEUS_VOICE:-tara}"   # tara leah jess leo dan mia zac zoe
 
 export PORT="${PORT:-8000}"
 

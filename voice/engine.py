@@ -1,19 +1,19 @@
 """
-Voice engine — speech in, speech out — lifted from the `real_time_voice` app so
-the realtime voice experience behaves identically after the merge.
+Voice engine — speech in, speech out — Orpheus only, lifted from the
+`real_time_voice` Orpheus build so the realtime voice experience is identical:
 
     browser mic (webm/mp4)  ->  ffmpeg -> 16k wav
                             ->  Whisper (MLX / Metal)        [speech -> text]
                             ->  Ollama chat model            [text -> reply]
-                            ->  Kokoro TTS / Orpheus / `say` [reply -> speech]
+                            ->  Orpheus TTS (emotion tags)   [reply -> speech]
                             ->  PCM streamed back to the browser
 
 Everything runs on-device. This module owns the voice pipeline + its OWN short
 spoken conversation history (kept separate from the rich text-chat history so the
 voice turn stays snappy and concise — the way it has always worked).
 
-The big TTS model files (Kokoro onnx/voices) are referenced via VOICE_MODELS_DIR
-rather than duplicated. Orpheus runs through Ollama (`orpheus-tts`) + SNAC.
+Orpheus runs through Ollama (`orpheus-tts`) + a SNAC decoder. macOS `say` is kept
+only as an emergency fallback if Orpheus errors.
 """
 
 import io
@@ -24,31 +24,16 @@ import tempfile
 import threading
 import wave
 
-import numpy as np
 import requests
-import soundfile as sf
 
 # ----------------------------------------------------------------------------
-# Config (override with env vars) — mirrors real_time_voice/server.py
+# Config (override with env vars)
 # ----------------------------------------------------------------------------
 OLLAMA_URL    = os.environ.get("OLLAMA_URL", "http://localhost:11434")
 WHISPER_REPO  = os.environ.get("WHISPER_REPO", "mlx-community/whisper-large-v3-turbo")
-TTS_ENGINE    = os.environ.get("TTS_ENGINE", "kokoro").lower()   # "kokoro" | "orpheus"
-TTS_VOICE     = os.environ.get("TTS_VOICE", "af_heart")          # Kokoro voice
 ORPHEUS_VOICE = os.environ.get("ORPHEUS_VOICE", "tara")          # Orpheus voice
-# Default voice chat brain — gemma4:12b is the smart brain the voice app shipped.
+# Default voice chat brain — gemma4:12b is the smart brain the realtime build ships.
 VOICE_LLM_MODEL = os.environ.get("VOICE_LLM_MODEL", os.environ.get("LLM_MODEL", "gemma4:12b"))
-
-# Where the large Kokoro model files live. Default: the real_time_voice models
-# dir (so we don't duplicate ~325MB), overridable via VOICE_MODELS_DIR.
-_DEFAULT_MODELS_DIR = os.environ.get(
-    "VOICE_MODELS_DIR",
-    "/Users/mharajli/Desktop/agent_space/real_time_voice/models",
-)
-# Fall back to a local ./models if the default path is gone (portable installs).
-HERE = os.path.dirname(os.path.abspath(__file__))
-_LOCAL_MODELS_DIR = os.path.join(os.path.dirname(HERE), "models")
-MODELS_DIR = _DEFAULT_MODELS_DIR if os.path.isdir(_DEFAULT_MODELS_DIR) else _LOCAL_MODELS_DIR
 
 # ----------------------------------------------------------------------------
 # Emotion tags + text cleaning (Orpheus renders <laugh>/<sigh>/… inline; we ask
@@ -88,14 +73,14 @@ def clean_for_tts(text: str) -> str:
     return re.sub(r"[ \t]{2,}", " ", text).strip()
 
 
-_BASE_PROMPT = (
+# The Orpheus system prompt — short spoken replies + the inline emotion tags
+# Orpheus renders. This is the realtime Orpheus build's prompt verbatim.
+SYSTEM_PROMPT = (
     "You are a friendly, concise voice assistant having a spoken conversation. "
     "Your replies are read aloud, so: keep them short (1-3 sentences), natural and "
     "conversational, and never use markdown, bullet points, code blocks, or emoji. "
     "Spell out things that should be spoken. If asked for a long answer, give the "
     "spoken-friendly short version and offer to go deeper."
-)
-_ORPHEUS_PROMPT = _BASE_PROMPT + (
     " Your expressive voice is slow to synthesize, so reply in ONE very short "
     "sentence (about 6 to 12 words) unless explicitly asked for more. To sound "
     "human, you may add occasional emotion cues "
@@ -103,7 +88,6 @@ _ORPHEUS_PROMPT = _BASE_PROMPT + (
     "<yawn>, <groan>, <sniffle>, <cough>. Use them sparingly, only where a real "
     "person naturally would, e.g. \"That's hilarious <laugh> I love it.\""
 )
-SYSTEM_PROMPT = _ORPHEUS_PROMPT if TTS_ENGINE == "orpheus" else _BASE_PROMPT
 
 # ----------------------------------------------------------------------------
 # Conversation state — the voice turn keeps its OWN short history so it stays
@@ -112,17 +96,14 @@ SYSTEM_PROMPT = _ORPHEUS_PROMPT if TTS_ENGINE == "orpheus" else _BASE_PROMPT
 _history = [{"role": "system", "content": SYSTEM_PROMPT}]
 _lock = threading.Lock()
 
-# Mutable runtime config (live-updatable from the UI settings panel).
 _state = {
     "model": VOICE_LLM_MODEL,
-    "engine": TTS_ENGINE,
-    "kokoro_voice": TTS_VOICE,
-    "orpheus_voice": ORPHEUS_VOICE,
+    "voice": ORPHEUS_VOICE,
 }
 
 
 def current_voice() -> str:
-    return _state["orpheus_voice"] if _state["engine"] == "orpheus" else _state["kokoro_voice"]
+    return _state["voice"]
 
 
 # ----------------------------------------------------------------------------
@@ -139,61 +120,19 @@ def transcribe(wav_path: str) -> str:
 
 
 # ----------------------------------------------------------------------------
-# Text-to-speech  (Kokoro if available, else macOS `say` as a robust fallback)
+# Text-to-speech  (Orpheus; macOS `say` only as an emergency fallback)
 # ----------------------------------------------------------------------------
-_kokoro = None
-_kokoro_ok = None  # tri-state: None=untried, True=ready, False=unavailable
-
-
-def _init_kokoro():
-    """Load Kokoro once. Returns True if usable."""
-    global _kokoro, _kokoro_ok
-    if _kokoro_ok is not None:
-        return _kokoro_ok
-    try:
-        from kokoro_onnx import Kokoro
-        model = os.path.join(MODELS_DIR, "kokoro-v1.0.onnx")
-        voices = os.path.join(MODELS_DIR, "voices-v1.0.bin")
-        _kokoro = Kokoro(model, voices)
-        _kokoro_ok = True
-        print("[tts] Kokoro ready")
-    except Exception as e:  # noqa: BLE001
-        _kokoro_ok = False
-        print(f"[tts] Kokoro unavailable ({e}); falling back to macOS `say`")
-    return _kokoro_ok
-
-
-def _wav_bytes(samples: np.ndarray, sr: int) -> bytes:
-    buf = io.BytesIO()
-    sf.write(buf, samples, sr, format="WAV", subtype="PCM_16")
-    return buf.getvalue()
-
-
 def synthesize(text: str) -> bytes:
-    """Return WAV bytes for `text` using the selected engine."""
-    engine = _state["engine"]
+    """Return WAV bytes for `text` via Orpheus (keeps emotion tags)."""
     text = text.strip()
     if not text:
         text = "Sorry, I didn't catch that."
-    if engine != "orpheus":
-        text = strip_emotion_tags(text)  # Kokoro/say shouldn't read tags literally
-
-    if engine == "orpheus":
-        try:
-            from . import orpheus_tts
-            return orpheus_tts.synthesize(text, _state["orpheus_voice"])
-        except Exception as e:  # noqa: BLE001
-            print(f"[tts] Orpheus failed ({e}); using `say`")
-        text = strip_emotion_tags(text)  # don't let `say` read tags aloud
-    elif _init_kokoro():
-        try:
-            samples, sr = _kokoro.create(text, voice=_state["kokoro_voice"], speed=1.0, lang="en-us")
-            return _wav_bytes(np.asarray(samples, dtype=np.float32), sr)
-        except Exception as e:  # noqa: BLE001
-            print(f"[tts] Kokoro synth failed ({e}); using `say`")
-
-    # Fallback: macOS built-in voice -> always works, just less natural.
-    return _say_wav(text)
+    try:
+        from . import orpheus_tts
+        return orpheus_tts.synthesize(text, _state["voice"])
+    except Exception as e:  # noqa: BLE001
+        print(f"[tts] Orpheus failed ({e}); using `say`")
+        return _say_wav(strip_emotion_tags(text))
 
 
 def _say_wav(text: str) -> bytes:
@@ -216,10 +155,7 @@ _SENT_SPLIT = re.compile(r"(?<=[.!?])\s+")
 
 
 def sentences(text: str):
-    """Split a reply into TTS-sized chunks, keeping emotion tags with their text.
-
-    A chunk that is only emotion tag(s) (e.g. a trailing "<laugh>") is merged
-    into the previous sentence rather than sent on its own."""
+    """Split a reply into TTS-sized chunks, keeping emotion tags with their text."""
     text = text.strip()
     if not text:
         return []
@@ -234,25 +170,19 @@ def sentences(text: str):
 
 
 def tts_stream(text: str, voice: str = None):
-    """Yield (pcm_int16_bytes, sample_rate) for `text`, streaming where possible."""
-    engine = _state["engine"]
-    if engine == "orpheus":
-        produced = False
-        try:
-            from . import orpheus_tts
-            for chunk in orpheus_tts.synthesize_stream(text, voice or _state["orpheus_voice"]):
-                produced = True
-                yield chunk, orpheus_tts.SAMPLE_RATE
-        except Exception as e:  # noqa: BLE001
-            print(f"[tts] Orpheus stream failed ({e}); using `say`")
-            # keep `produced` as-is: if Orpheus already emitted 24k audio, do NOT
-            # also append 22.05k `say` PCM into the same sentence buffer.
-        if not produced:
-            yield _wav_to_pcm(_say_wav(strip_emotion_tags(text)))
-        return
-
-    # Kokoro (or say): synthesize the whole sentence, emit as one chunk.
-    yield _wav_to_pcm(synthesize(text))
+    """Yield (pcm_int16_bytes, sample_rate) for `text`, streaming Orpheus windows
+    (~85 ms) as the tokens arrive so playback starts almost immediately."""
+    produced = False
+    try:
+        from . import orpheus_tts
+        for chunk in orpheus_tts.synthesize_stream(text, voice or _state["voice"]):
+            produced = True
+            yield chunk, orpheus_tts.SAMPLE_RATE
+    except Exception as e:  # noqa: BLE001
+        print(f"[tts] Orpheus stream failed ({e}); using `say`")
+        # If Orpheus already emitted 24k audio, do NOT also append `say` PCM.
+    if not produced:
+        yield _wav_to_pcm(_say_wav(strip_emotion_tags(text)))
 
 
 # ----------------------------------------------------------------------------
@@ -260,8 +190,7 @@ def tts_stream(text: str, voice: str = None):
 # ----------------------------------------------------------------------------
 def chat(user_text: str) -> str:
     # Transactional: only commit the user turn alongside the assistant reply
-    # AFTER success, so a failed turn can't leave a dangling user message that
-    # corrupts later context.
+    # AFTER success, so a failed turn can't leave a dangling user message.
     with _lock:
         messages = list(_history) + [{"role": "user", "content": user_text}]
 
@@ -276,10 +205,9 @@ def chat(user_text: str) -> str:
     r.raise_for_status()
     reply = r.json()["message"]["content"].strip()
 
-    stored = reply if _state["engine"] == "orpheus" else strip_emotion_tags(reply)
     with _lock:
         _history.append({"role": "user", "content": user_text})
-        _history.append({"role": "assistant", "content": stored})
+        _history.append({"role": "assistant", "content": reply})  # keep emotion tags
     return reply
 
 
@@ -313,9 +241,7 @@ def to_wav16k(src_bytes: bytes, suffix: str) -> str:
     dst = src + ".16k.wav"
     subprocess.run(
         ["ffmpeg", "-y", "-i", src, "-ar", "16000", "-ac", "1", dst],
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
     os.unlink(src)
     return dst
@@ -324,37 +250,27 @@ def to_wav16k(src_bytes: bytes, suffix: str) -> str:
 # ----------------------------------------------------------------------------
 # Voice config helpers (for the UI settings panel)
 # ----------------------------------------------------------------------------
-KOKORO_VOICES = ["af_heart", "af_bella", "af_nicole", "af_sarah", "af_sky",
-                 "am_adam", "am_michael", "am_fenrir", "bf_emma", "bf_isabella",
-                 "bm_george", "bm_lewis"]
-
-
 def available_voices():
-    if _state["engine"] == "orpheus":
-        try:
-            from . import orpheus_tts
-            return orpheus_tts.AVAILABLE_VOICES
-        except Exception:  # noqa: BLE001
-            return KOKORO_VOICES
-    return KOKORO_VOICES
+    try:
+        from . import orpheus_tts
+        return list(orpheus_tts.AVAILABLE_VOICES)
+    except Exception:  # noqa: BLE001
+        return ["tara", "leah", "jess", "leo", "dan", "mia", "zac", "zoe"]
 
 
 def tts_label() -> str:
-    if _state["engine"] == "orpheus":
-        return f"orpheus:{_state['orpheus_voice']}"
-    return "kokoro" if _init_kokoro() else "say"
+    return f"orpheus:{_state['voice']}"
 
 
 def list_chat_models():
-    """Ollama models usable as the chat/voice brain (exclude the TTS model)."""
+    """Every Ollama chat model usable as the brain (exclude the TTS model)."""
     try:
         r = requests.get(f"{OLLAMA_URL}/api/tags", timeout=5)
         r.raise_for_status()
         names = [m["name"] for m in r.json().get("models", [])]
         usable = sorted(
             n for n in names
-            if not n.lower().startswith(("orpheus", "snac"))
-            and "tts" not in n.lower()
+            if not n.lower().startswith(("orpheus", "snac")) and "tts" not in n.lower()
         )
         return usable or [_state["model"]]
     except Exception:  # noqa: BLE001
@@ -369,30 +285,22 @@ def ollama_ok() -> bool:
         return False
 
 
-def set_config(model=None, voice=None, engine=None, system_prompt=None):
-    """Live-update the voice brain / engine / voice / system prompt from the UI."""
-    if engine:
-        _state["engine"] = engine.lower()
+def set_config(model=None, voice=None, system_prompt=None):
+    """Live-update the voice brain / voice / system prompt from the UI."""
     if model:
         _state["model"] = model
     if voice:
-        if _state["engine"] == "orpheus":
-            _state["orpheus_voice"] = voice
-        else:
-            _state["kokoro_voice"] = voice
+        _state["voice"] = voice
     if system_prompt is not None:
         set_system_prompt(system_prompt)
     return dict(_state)
 
 
 def warm():
-    """Pre-load Whisper + Kokoro + the LLM so the first real turn is fast."""
+    """Pre-load Whisper + Orpheus + the LLM so the first spoken turn is fast."""
     try:
-        if _state["engine"] == "orpheus":
-            from . import orpheus_tts
-            orpheus_tts.synthesize("Hello there.", _state["orpheus_voice"])
-        else:
-            _init_kokoro()
+        from . import orpheus_tts
+        orpheus_tts.synthesize("Hello there.", _state["voice"])
         tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
         subprocess.run(["say", "-o", tmp, "--data-format=LEI16@22050", "ready"], check=True)
         transcribe(tmp)

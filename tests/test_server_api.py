@@ -185,9 +185,10 @@ def test_ws_generation_error_sends_terminal_frame(monkeypatch, client):
 
 # --- voice config endpoints ------------------------------------------------
 def test_voice_config_roundtrip(client):
-    r = client.post("/api/voice/config", json={"engine": "kokoro", "voice": "am_adam"})
+    r = client.post("/api/voice/config", json={"voice": "leo"})
     assert r.json()["ok"] is True
     cfg = client.get("/api/voice/config").json()
-    assert cfg["voice"] == "am_adam"
+    assert cfg["voice"] == "leo"
+    assert "tara" in cfg["voices"]          # Orpheus voices
     # restore default
-    client.post("/api/voice/config", json={"voice": "af_heart", "model": "gemma4:12b"})
+    client.post("/api/voice/config", json={"voice": "tara", "model": "gemma4:12b"})

@@ -14,14 +14,12 @@ Pillow>=10.0
 ddgs>=9.0
 requests>=2.31
 
-# --- realtime voice: STT + TTS ---
+# --- realtime voice: STT + Orpheus TTS ---
 numpy>=1.26
 soundfile>=0.12
 mlx-whisper>=0.4        # speech-to-text (Apple Silicon / Metal)
-kokoro-onnx>=0.4        # fast neutral TTS (default engine)
-
-# --- optional: Orpheus emotive TTS (set TTS_ENGINE=orpheus) ---
-# Runs the Orpheus GGUF via Ollama; decodes audio tokens with SNAC on the GPU.
+# Orpheus emotive TTS: runs the Orpheus GGUF via Ollama and decodes the audio
+# tokens with SNAC on the GPU (mps).
 snac>=1.2
 torch>=2.2
 

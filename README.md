@@ -5,8 +5,18 @@ does two things in one cohesive surface:
 
 - **Rich text chat** — streaming markdown, image upload & multimodal, **tool calling** (live web
   search + object detection with bounding boxes), throughput stats, a context meter.
-- **Realtime voice** — a hands-free, tap-to-talk conversation: speech-to-text (Whisper), the Gemma
-  brain, and streamed text-to-speech (Kokoro or the expressive Orpheus), played back gaplessly.
+- **Realtime voice** — speech-to-text (Whisper), the Gemma brain, and streamed **Orpheus** TTS
+  (expressive, with inline emotion tags), played back gaplessly — the realtime_voice experience.
+
+Two toggles give a 2×2 of input × output:
+
+| | **Speak: off** | **Speak: on** |
+|---|---|---|
+| **Mic: off** | type → text reply (rich chat, tools) | type → **spoken** reply |
+| **Mic: on** | talk → text reply | talk → **spoken** reply |
+
+The two **Speak-on** paths use realtime's exact endpoints (`/api/converse_text`,
+`/api/converse_stream`), so spoken replies are identical in quality to the realtime_voice app.
 
 Everything runs on-device. The "brain" — **`gemma4:12b`** by default — is shared: pick a model once
 and both the text chat and the voice loop use it.
@@ -40,7 +50,7 @@ your privileged tailnet devices can reach it (not the wider local network). It p
   from your phone, run `tailscale serve 8000` and open the `https://…` URL it gives you.
 
 Knobs: `PORT=8010 ./run.sh`, `VENV_PYTHON=/path/to/python ./run.sh`,
-`TTS_ENGINE=orpheus ./run.sh`, `ORPHEUS_VOICE=leo ./run.sh`.
+`ORPHEUS_VOICE=leo ./run.sh`, `VOICE_LLM_MODEL=gemma4:e4b ./run.sh` (snappier voice brain).
 
 ---
 
@@ -56,7 +66,7 @@ Knobs: `PORT=8010 ./run.sh`, `VENV_PYTHON=/path/to/python ./run.sh`,
 ### The environment
 
 The app needs **both** stacks: the chat stack (`ollama`, `Pillow`, `ddgs`) **and** the voice ML stack
-(`mlx-whisper`, `kokoro-onnx`, `numpy`, `soundfile`, and optionally `snac`+`torch` for Orpheus).
+(`mlx-whisper` for STT, and `snac`+`torch` for Orpheus TTS, plus `numpy`/`soundfile`).
 
 On this machine that's the `real_time_voice` venv with the chat deps added — which is exactly what
 `run.sh` points at by default (`VENV_PYTHON` overrides it). To build a fresh combined env instead:
@@ -67,8 +77,8 @@ pip install -r requirements.txt
 VENV_PYTHON=venv/bin/python ./run.sh
 ```
 
-The large TTS model files (Kokoro `*.onnx`/`*.bin`) are referenced from `VOICE_MODELS_DIR` (defaults to
-the `real_time_voice/models` folder) rather than copied. Orpheus runs through Ollama (`orpheus-tts`).
+Orpheus runs the GGUF through Ollama (`orpheus-tts`) and decodes audio tokens with SNAC on the GPU —
+no large model files to copy. Whisper weights come from the HuggingFace cache.
 
 ---
 
@@ -80,11 +90,11 @@ the `real_time_voice/models` folder) rather than copied. Orpheus runs through Ol
   calls `detect_objects` and renders bounding boxes inline.
 - **Web search** — ask about current events; the model calls `web_search` (DuckDuckGo) and answers
   from the results (shown in a collapsible card).
-- **Voice** — tap the **mic orb**. It listens, detects when you stop, transcribes, thinks, and speaks
-  the reply — then re-arms automatically. Tap again to stop. Your turn and the reply appear in the
-  same thread (spoken replies are set in the serif "voice").
-- **Settings (gear)** — TTS engine (Kokoro/Orpheus), voice, the voice "personality" (spoken-reply
-  system prompt), and mic sensitivity.
+- **Voice** — flip **Mic** on to talk hands-free: it listens, detects when you stop, and replies.
+  Flip **Speak** on to hear replies aloud (Orpheus). With Mic on it re-arms after each turn; flip it
+  off to stop. The 2×2 of Mic × Speak is the table at the top.
+- **Settings (gear)** — Orpheus voice, the voice "personality" (spoken-reply system prompt), and
+  mic sensitivity.
 - **Model picker** — the shared brain; `gemma4:12b` by default. Switching it points both chat and
   voice at the new model.
 - **Voice playground** — `/tts` (also linked from settings): type text with emotion tags and hear it.
@@ -101,11 +111,11 @@ the `real_time_voice/models` folder) rather than copied. Orpheus runs through Ol
                        (text)      ▼                                  (voice)      ▼
                        ┌───────────────────────────  FastAPI server.py  ───────────────────────────┐
                        │  tool-calling chat loop          │       voice/routes.py → voice/engine.py │
-                       │  (web_search, detect_objects)    │       Whisper STT · brain · Kokoro/Orph. │
+                       │  (web_search, detect_objects)    │       Whisper STT · brain ·  Orpheus TTS  │
                        └───────────┬──────────────────────┴──────────────────┬──────────────────────┘
                                    ▼                                          ▼
                           ┌────────────────┐  ┌────────┐  ┌────────┐   ┌──────────┐  ┌──────────────┐
-                          │ Ollama gemma4  │  │  DDGS  │  │ ffmpeg │   │ MLX Whisper │ Kokoro/Orpheus│
+                          │ Ollama gemma4  │  │  DDGS  │  │ ffmpeg │   │ MLX Whisper │ Orpheus TTS  │
                           └────────────────┘  └────────┘  └────────┘   └──────────┘  └──────────────┘
 ```
 
@@ -116,7 +126,7 @@ the `real_time_voice/models` folder) rather than copied. Orpheus runs through Ol
 | `voice/routes.py` | Voice REST endpoints: `/api/converse_stream`, `/api/converse_text`, `/api/speak`, `/api/voice/*` |
 | `voice/orpheus_tts.py` | Orpheus-over-Ollama + SNAC decoder (expressive TTS) |
 | `web_search.py` | DuckDuckGo search tool |
-| `static/` | Unified UI (chat + voice orb), the `/tts` playground, self-hosted fonts |
+| `static/` | Unified dark UI (chat + Mic/Speak toggles), the `/tts` playground |
 | `run.sh` | Launcher (runs through the venv; `--tailnet` for phone access) |
 | `tests/` | Unit + integration tests (LLM/TTS/STT mocked) |
 

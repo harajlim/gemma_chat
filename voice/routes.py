@@ -38,7 +38,6 @@ def voice_health():
         "model": engine._state["model"],
         "ollama": engine.ollama_ok(),
         "tts": engine.tts_label(),
-        "engine": engine._state["engine"],
     }
 
 
@@ -55,7 +54,6 @@ def voice_get_config():
         "models": engine.list_chat_models(),
         "voice": engine.current_voice(),
         "voices": engine.available_voices(),
-        "engine": engine._state["engine"],
         "system_prompt": engine.get_system_prompt(),
         "default_system_prompt": engine.SYSTEM_PROMPT,
     }
@@ -66,11 +64,9 @@ def voice_set_config(cfg: dict = Body(...)):
     state = engine.set_config(
         model=cfg.get("model"),
         voice=cfg.get("voice"),
-        engine=cfg.get("engine"),
         system_prompt=cfg.get("system_prompt"),
     )
-    return {"ok": True, "model": state["model"], "engine": state["engine"],
-            "voice": engine.current_voice()}
+    return {"ok": True, "model": state["model"], "voice": engine.current_voice()}
 
 
 def _turn_stream(user_text_or_none, raw_audio=None, suffix=".webm"):
@@ -116,6 +112,21 @@ def _turn_stream(user_text_or_none, raw_audio=None, suffix=".webm"):
         print(f"[voice] error: {e}")
         yield _json.dumps({"type": "error", "message": str(e)}) + "\n"
         yield _json.dumps({"type": "done"}) + "\n"
+
+
+@router.post("/api/transcribe")
+async def transcribe_audio(audio: UploadFile = File(...)):
+    """Speech -> text only (Whisper). Used by the 'talk -> text reply' combo,
+    which feeds the transcript into the rich WS chat instead of the voice TTS."""
+    raw = await audio.read()
+    suffix = os.path.splitext(audio.filename or "")[1] or ".webm"
+    wav_path = engine.to_wav16k(raw, suffix)
+    try:
+        text = engine.transcribe(wav_path)
+    finally:
+        if os.path.exists(wav_path):
+            os.unlink(wav_path)
+    return JSONResponse({"text": text})
 
 
 @router.post("/api/converse_stream")
