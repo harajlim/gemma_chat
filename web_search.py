@@ -16,6 +16,7 @@ missing (that's a known limit; a plain-text source like wttr.in is the fallback
 for those).
 """
 
+import datetime
 import html
 import os
 import re
@@ -66,16 +67,27 @@ def _fetch(url: str) -> str:
 _WX_WORDS = r"weather|temperatures?|temp|forecast|degrees?|humidity|rain(?:ing)?|snow(?:ing)?|sunny|cloudy|windy|wind|hot|cold|warm|cool|chilly|freezing"
 _WEATHER_RE = re.compile(r"\b(?:" + _WX_WORDS + r")\b", re.I)
 _FILLER = re.compile(
-    r"\b(?:what|whats|what's|is|are|it|its|the|a|an|in|at|for|right|now|today|tonight|"
-    r"tomorrow|current|currently|like|of|how|me|tell|please|can|could|you|get|there|to|do|outside)\b",
+    r"\b(?:what|whats|what's|is|are|it|its|the|a|an|in|at|on|for|right|now|today|tonight|"
+    r"tomorrow|current|currently|like|of|how|me|tell|please|can|could|you|get|there|to|do|"
+    r"outside|will|be|going|this|next|later|and|"
+    # temporal words that are NOT locations
+    r"day|days|week|weekend|morning|afternoon|evening|night|"
+    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
     re.I,
 )
+
+
+_MONTHS = re.compile(
+    r"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|"
+    r"aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\b", re.I)
 
 
 def _extract_location(query: str) -> str:
     loc = re.sub(r"[’'`]", "", query)        # what's -> whats (so the filler matches it)
     loc = _WEATHER_RE.sub(" ", loc)
+    loc = _MONTHS.sub(" ", loc)
     loc = _FILLER.sub(" ", loc)
+    loc = re.sub(r"\b\d+(?:st|nd|rd|th)?\b", " ", loc)   # dates/years: 10, 2026, 3rd
     loc = re.sub(r"[^\w\s,.\-]", " ", loc)
     return re.sub(r"\s+", " ", loc).strip()
 
@@ -92,8 +104,24 @@ def _area_name(j: dict) -> str:
     return ", ".join(parts)
 
 
+def _forecast_lines(j: dict) -> list[str]:
+    out = []
+    for day in (j.get("weather") or [])[:3]:
+        date = day.get("date", "")
+        try:  # label with the weekday so the model can match "Tuesday" without date math
+            weekday = datetime.datetime.strptime(date, "%Y-%m-%d").strftime("%A")
+        except Exception:  # noqa: BLE001
+            weekday = ""
+        hourly = day.get("hourly") or []
+        mid = hourly[len(hourly) // 2] if hourly else {}
+        desc = (mid.get("weatherDesc") or [{}])[0].get("value", "")
+        out.append(f"{weekday} {date}: high {day.get('maxtempF','?')}°F, "
+                   f"low {day.get('mintempF','?')}°F, {desc}".strip())
+    return out
+
+
 def _weather(query: str):
-    """Return a plain-text live-weather line for a weather query, or None."""
+    """Return a plain-text live-weather + 3-day forecast line, or None."""
     loc = _extract_location(query)
     try:
         r = requests.get(f"https://wttr.in/{quote(loc)}?format=j1",
@@ -103,9 +131,13 @@ def _weather(query: str):
     except Exception:  # noqa: BLE001
         return None
     where = _area_name(j) or loc or "your area"
-    return (f"Live current weather for {where}: {c['temp_F']}°F ({c['temp_C']}°C), "
+    fc = _forecast_lines(j)
+    line = (f"Live current weather for {where}: {c['temp_F']}°F ({c['temp_C']}°C), "
             f"feels like {c['FeelsLikeF']}°F, {c['weatherDesc'][0]['value']}, "
-            f"humidity {c['humidity']}%, wind {c['windspeedMiles']} mph. (source: wttr.in)")
+            f"humidity {c['humidity']}%, wind {c['windspeedMiles']} mph.")
+    if fc:
+        line += " Forecast (only these dates are available) — " + "; ".join(fc) + "."
+    return line + " (source: wttr.in)"
 
 
 def web_search(query: str, max_results: int = 5) -> list[dict]:
