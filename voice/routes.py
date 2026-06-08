@@ -16,6 +16,7 @@ NDJSON event protocol (one JSON object per line):
 """
 
 import base64
+import datetime
 import json as _json
 import os
 import time
@@ -65,9 +66,10 @@ def voice_set_config(cfg: dict = Body(...)):
 
 
 _TOOL_HINT = (
-    "You can use tools: web_search for current/online facts, and detect_objects to find things "
-    "in an image the user attached. Call a tool when it would help, then reply in one short spoken "
-    "sentence. Do not mention tool names or JSON; just answer naturally."
+    "Anything current — weather, news, prices, scores — call web_search first (for weather just "
+    "search; with no city it uses the local area). For an attached image, use detect_objects. "
+    "Answer only from the results; if the value isn't there, say you couldn't find it. Never "
+    "mention tools or JSON."
 )
 
 
@@ -82,11 +84,19 @@ def _voice_reply(user_text: str, image_ids):
     with engine._lock:
         base = list(engine._history)
 
-    sys_msgs = [{"role": "system", "content": _TOOL_HINT}]
+    # Extra guidance is folded into the LEADING system message rather than added
+    # as separate system turns: some chat templates (e.g. qwen) require the system
+    # message to be first and ONLY first, and raise otherwise.
+    extra = [_TOOL_HINT, f"The current date is {datetime.datetime.now():%A, %B %d, %Y}."]
     if valid_imgs:
         lst = ", ".join(f"image (id: {i})" for i in valid_imgs)
-        sys_msgs.append({"role": "system", "content":
-                         f"The user attached: {lst}. When calling detect_objects, use the image_id."})
+        extra.append(f"The user attached: {lst}. When calling detect_objects, use the image_id.")
+
+    if base and base[0].get("role") == "system":
+        head = {"role": "system", "content": (base[0]["content"] + " " + " ".join(extra)).strip()}
+        messages = [head] + base[1:]
+    else:
+        messages = [{"role": "system", "content": " ".join(extra)}] + base
 
     user_msg = {"role": "user", "content": user_text}
     media = []
@@ -96,7 +106,7 @@ def _voice_reply(user_text: str, image_ids):
     if media:
         user_msg["images"] = media
 
-    messages = base + sys_msgs + [user_msg]
+    messages.append(user_msg)
     final_text = None
 
     for _ in range(MAX_TOOL_STEPS):

@@ -162,6 +162,30 @@ def test_converse_text_speaks_tool_announcement(monkeypatch, client):
     assert calls["n"] == 2
 
 
+def test_voice_messages_single_leading_system(monkeypatch, client):
+    """Voice turns must send exactly ONE system message, at index 0 — some chat
+    templates (qwen) raise if a system message appears anywhere else."""
+    from voice import routes
+    engine.reset_history()
+    engine._history.append({"role": "user", "content": "earlier"})
+    engine._history.append({"role": "assistant", "content": "reply"})
+
+    captured = {}
+
+    def fake_chat(*a, **k):
+        captured["messages"] = k.get("messages")
+        return _resp(content="ok")
+
+    monkeypatch.setattr(routes, "ollama_chat", fake_chat)
+    monkeypatch.setattr(engine, "tts_stream", lambda t, voice=None: iter([(b"\x00\x00" * 10, 24000)]))
+
+    client.post("/api/converse_text", data={"text": "now"})
+    msgs = captured["messages"]
+    system_positions = [i for i, m in enumerate(msgs) if m.get("role") == "system"]
+    assert system_positions == [0]
+    engine.reset_history()
+
+
 def test_converse_text_empty_is_graceful(monkeypatch, client):
     r = client.post("/api/converse_text", data={"text": "   "})
     events = [json.loads(l) for l in r.text.splitlines() if l.strip()]

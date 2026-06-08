@@ -293,14 +293,23 @@ async function startConversation() {
   mimeType = pickMime();
   if (!isGenerating && !turnBusy) armListening(); else setState("thinking");
 }
+// Turning the mic OFF stops voice INPUT only. Any reply already in flight keeps
+// playing AND still commits to history — flipping the mic must not kill the answer
+// (killing it mid-turn drops the turn from history and corrupts later context).
 function stopConversation() {
-  running = false; clearInterval(vadTimer);
+  running = false;
+  clearInterval(vadTimer);
   if (recorder && recorder.state !== "inactive") { recorder.onstop = null; recorder.stop(); }
-  scheduledSources.forEach(s => { try { s.stop(); } catch (e) {} }); scheduledSources = [];
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  if (!turnBusy) setState("idle");   // if a turn is speaking, let it finish -> idle on its own
+}
+
+// Hard stop: abort the in-flight turn AND kill playback. Used by Clear chat only.
+function abortVoice() {
   if (convAbort) { try { convAbort.abort(); } catch (e) {} convAbort = null; }
+  scheduledSources.forEach(s => { try { s.stop(); } catch (e) {} });
+  scheduledSources = [];
   endTurn();
-  if (stream) stream.getTracks().forEach(t => t.stop());
-  setState("idle");
 }
 function pauseListening() { clearInterval(vadTimer); if (recorder && recorder.state !== "inactive") { recorder.onstop = null; recorder.stop(); } }
 function maybeRearm() { if (micOn && running && !turnBusy && !isGenerating) armListening(); }
@@ -371,6 +380,7 @@ textarea.addEventListener("paste", (e) => { const items = e.clipboardData?.items
 //  Clear
 // ===========================================================================
 function clearChat() {
+  abortVoice();                       // full reset: kill any in-flight reply + playback
   if (running) { micOn = false; updateMicUI(); stopConversation(); }
   sessionId = null; currentBubble = null; currentBubbleText = ""; isGenerating = false;
   pendingImages = []; document.getElementById("imagePreviews").innerHTML = "";
