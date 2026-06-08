@@ -82,11 +82,19 @@ def _voice_reply(user_text: str, image_ids):
     with engine._lock:
         base = list(engine._history)
 
-    sys_msgs = [{"role": "system", "content": _TOOL_HINT}]
+    # Extra guidance is folded into the LEADING system message rather than added
+    # as separate system turns: some chat templates (e.g. qwen) require the system
+    # message to be first and ONLY first, and raise otherwise.
+    extra = [_TOOL_HINT]
     if valid_imgs:
         lst = ", ".join(f"image (id: {i})" for i in valid_imgs)
-        sys_msgs.append({"role": "system", "content":
-                         f"The user attached: {lst}. When calling detect_objects, use the image_id."})
+        extra.append(f"The user attached: {lst}. When calling detect_objects, use the image_id.")
+
+    if base and base[0].get("role") == "system":
+        head = {"role": "system", "content": (base[0]["content"] + " " + " ".join(extra)).strip()}
+        messages = [head] + base[1:]
+    else:
+        messages = [{"role": "system", "content": " ".join(extra)}] + base
 
     user_msg = {"role": "user", "content": user_text}
     media = []
@@ -96,7 +104,7 @@ def _voice_reply(user_text: str, image_ids):
     if media:
         user_msg["images"] = media
 
-    messages = base + sys_msgs + [user_msg]
+    messages.append(user_msg)
     final_text = None
 
     for _ in range(MAX_TOOL_STEPS):
