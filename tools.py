@@ -81,7 +81,11 @@ TOOLS = [
             "description": (
                 "Search the web via DuckDuckGo for current information. "
                 "Use this for questions about recent events, current facts, "
-                "or anything that requires up-to-date knowledge beyond your training data."
+                "or anything that requires up-to-date knowledge beyond your training data. "
+                "Each result includes a 'content' excerpt fetched from the page — base your "
+                "answer ONLY on those excerpts/snippets. If the specific value (e.g. a "
+                "temperature or price) isn't present in the results, say you couldn't find "
+                "it rather than guessing."
             ),
             "parameters": {
                 "type": "object",
